@@ -11,7 +11,7 @@ const ftpConfig = {
     host: process.env.FTP_HOST,
     user: process.env.FTP_USER,
     password: process.env.FTP_PASSWORD,
-    secure: true, // Use 'implicit' or true for FTPS
+    secure: 'implicit', // Use 'implicit' or true for FTPS
 };
 
 // Endpoint to list files in the specified directory
