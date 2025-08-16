@@ -1,0 +1,6 @@
+{
+  "name": "Shopify-FTP Product Auditor",
+  "description": "An application to audit a Shopify store's product catalog against product data from CSV files on an FTP server. It identifies missing products and data discrepancies.",
+  "requestFramePermissions": [],
+  "prompt": ""
+}
