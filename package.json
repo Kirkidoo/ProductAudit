@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev:client": "vite",
-    "dev:server": "ts-node server.ts",
+    "dev:server": "node --loader ts-node/esm server.ts",
     "build": "vite build",
     "preview": "vite preview"
   },
