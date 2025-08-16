@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev:client": "vite",
-    "dev:server": "node --loader ts-node/esm server.ts",
+    "dev:server": "npm run build:server && node dist/server/server.js",
+    "build:server": "tsc -p tsconfig.server.json",
     "build": "vite build",
     "preview": "vite preview"
   },
