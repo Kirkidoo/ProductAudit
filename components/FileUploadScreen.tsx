@@ -1,10 +1,7 @@
-
-
-import React, { useState, useCallback } from 'react';
-import { UploadIcon, SpinnerIcon, AlertTriangleIcon } from './icons';
+import React, { useState, useEffect } from 'react';
+import { SpinnerIcon, AlertTriangleIcon, DocumentIcon, CheckCircleIcon } from './icons';
 import { parseCsvToProducts, ParsedCsvResult } from '../utils/csvHelper';
 import { Product } from '../types';
-import CsvPreviewTable from './CsvPreviewTable';
 
 interface FileUploadScreenProps {
   onRunAudit: (products: Product[], clearanceSkus: Set<string>, forceRefresh: boolean, useBulkOperation: boolean, fileNames: string[]) => void;
@@ -17,165 +14,155 @@ type ParsedFileResult = {
 };
 
 const FileUploadScreen: React.FC<FileUploadScreenProps> = ({ onRunAudit, onBack }) => {
-  const [parsedResults, setParsedResults] = useState<ParsedFileResult[]>([]);
+  const [ftpFiles, setFtpFiles] = useState<string[]>([]);
+  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  const [isLoadingFiles, setIsLoadingFiles] = useState(true);
+  const [ftpError, setFtpError] = useState('');
+
+  const [parsedResult, setParsedResult] = useState<ParsedFileResult | null>(null);
   const [isParsing, setIsParsing] = useState(false);
   const [parseError, setParseError] = useState('');
-  const [isDragging, setIsDragging] = useState(false);
-  const [forceRefresh, setForceRefresh] = useState(false);
-  const [activeTab, setActiveTab] = useState('');
 
-  const handleFilesSelected = async (files: File[]) => {
-    if (files.length === 0) return;
-    
+  const [forceRefresh, setForceRefresh] = useState(false);
+
+  useEffect(() => {
+    const fetchFtpFiles = async () => {
+      try {
+        const response = await fetch('/api/ftp/files');
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.details || 'Failed to fetch files');
+        }
+        const files = await response.json();
+        setFtpFiles(files);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "An unknown error occurred.";
+        setFtpError(`Could not load files from FTP server. Please ensure the backend server is running and configured correctly. Details: ${message}`);
+      } finally {
+        setIsLoadingFiles(false);
+      }
+    };
+
+    fetchFtpFiles();
+  }, []);
+
+  const handleProcessFile = async () => {
+    if (!selectedFile) return;
+
     setIsParsing(true);
     setParseError('');
-    setParsedResults([]);
-    
-    const results: ParsedFileResult[] = [];
+    setParsedResult(null);
+
     try {
-      for (const file of files) {
-        if (file.type !== 'text/csv' && !file.name.endsWith('.csv')) {
-          console.warn(`Skipping non-CSV file: ${file.name}`);
-          continue;
-        }
-        const content = await file.text();
-        const isClearanceFile = file.name.toLowerCase().includes('clearance');
-        const result = await parseCsvToProducts(content, isClearanceFile);
-        results.push({ fileName: file.name, result });
+      const response = await fetch(`/api/ftp/file?name=${encodeURIComponent(selectedFile)}`);
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.details || 'Failed to download file');
       }
-      setParsedResults(results);
-      if(results.length > 0) {
-        setActiveTab(results[0].fileName);
-      }
+      const content = await response.text();
+      const isClearanceFile = selectedFile.toLowerCase().includes('clearance');
+      const result = await parseCsvToProducts(content, isClearanceFile);
+      setParsedResult({ fileName: selectedFile, result });
     } catch (err) {
-      const message = err instanceof Error ? err.message : "An unknown error occurred during parsing.";
+      const message = err instanceof Error ? err.message : "An unknown error occurred during processing.";
       setParseError(message);
     } finally {
       setIsParsing(false);
     }
   };
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files) {
-      handleFilesSelected(Array.from(e.target.files));
-      e.target.value = ''; // Allow re-uploading the same file
-    }
-  };
   
-  const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(true);
-  }, []);
-
-  const handleDragLeave = useCallback((e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-  }, []);
-
-  const handleDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-      handleFilesSelected(Array.from(e.dataTransfer.files));
-      e.dataTransfer.clearData();
-    }
-  }, []);
-
-  const useBulkOperation = parsedResults.some(r => 
-      r.fileName.toLowerCase().includes('shopifyproductimport.csv')
-  );
-
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const allProducts = parsedResults.flatMap(r => r.result.products);
-    if (allProducts.length > 0) {
+    if (parsedResult) {
+      const allProducts = parsedResult.result.products;
       const clearanceSkus = new Set(allProducts.filter(p => p.isClearance).map(p => p.SKU));
-      const fileNames = parsedResults.map(r => r.fileName);
-      onRunAudit(allProducts, clearanceSkus, forceRefresh, useBulkOperation, fileNames);
+      const useBulkOperation = parsedResult.fileName.toLowerCase().includes('shopifyproductimport.csv');
+      onRunAudit(allProducts, clearanceSkus, forceRefresh, useBulkOperation, [parsedResult.fileName]);
     }
   };
   
-  const totalValidProducts = parsedResults.reduce((acc, r) => acc + r.result.products.length, 0);
-  const currentActiveResult = parsedResults.find(r => r.fileName === activeTab)?.result;
+  const totalValidProducts = parsedResult?.result.products.length ?? 0;
 
-  const Dropzone = () => (
-    <div 
-        className={`relative block w-full rounded-lg border-2 border-dashed transition-colors duration-300
-          ${isDragging ? 'border-indigo-500 bg-indigo-50' : 'border-slate-300 hover:border-slate-400'}
-          ${parsedResults.length > 0 ? 'p-4' : 'p-12'}`
-        }
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-    >
-        <input id="file-upload" name="file-upload" type="file" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" multiple accept=".csv,text/csv" onChange={handleFileChange} disabled={isParsing} />
-        <div className="flex flex-col items-center justify-center text-center">
-            {isParsing ? (
-                <>
-                    <SpinnerIcon />
-                    <span className="mt-2 block text-sm font-medium text-slate-900">Parsing files...</span>
-                </>
-            ) : (
-                <>
-                    <UploadIcon className={`mx-auto text-slate-400 transition-transform duration-300 ${isDragging ? 'scale-110' : ''} ${parsedResults.length > 0 ? 'h-8 w-8' : 'h-12 w-12'}`} />
-                    <span className="mt-2 block text-sm font-medium text-slate-900">
-                        <span className="text-indigo-600 hover:text-indigo-500">{parsedResults.length > 0 ? 'Click to replace files' : 'Click to upload files'}</span> or drag and drop
-                    </span>
-                    <span className="mt-1 block text-xs text-slate-500">CSV files only</span>
-                </>
-            )}
-        </div>
+  const FtpFileSelector = () => (
+    <div className="w-full p-4 rounded-lg border-2 border-dashed border-slate-300">
+        <h3 className="text-lg font-medium text-slate-800 mb-4">Select a File from FTP</h3>
+        {isLoadingFiles && (
+            <div className="flex items-center text-slate-500">
+                <SpinnerIcon />
+                <span className="ml-2">Loading files from FTP server...</span>
+            </div>
+        )}
+        {ftpError && (
+            <div className="bg-rose-50 border-l-4 border-rose-400 text-rose-800 p-4 rounded-md" role="alert">
+                <p className="font-bold flex items-center"><AlertTriangleIcon className="h-5 w-5 mr-2 text-rose-500" />FTP Connection Error</p>
+                <p className="text-sm mt-1">{ftpError}</p>
+            </div>
+        )}
+        {!isLoadingFiles && !ftpError && (
+             <div className="space-y-3">
+                {ftpFiles.length > 0 ? (
+                    ftpFiles.map(file => (
+                        <div key={file} className={`flex items-center p-3 rounded-md transition-colors cursor-pointer ${selectedFile === file ? 'bg-indigo-100 border-indigo-300' : 'bg-slate-50 hover:bg-slate-100 border-slate-200'} border`}
+                             onClick={() => {
+                                 setSelectedFile(file);
+                                 setParsedResult(null); // Reset if a new file is selected
+                                 setParseError('');
+                             }}
+                        >
+                            <DocumentIcon className="h-6 w-6 text-slate-500 mr-3" />
+                            <span className="font-medium text-slate-700">{file}</span>
+                        </div>
+                    ))
+                ) : (
+                    <p className="text-slate-500">No CSV files found in the specified FTP directory.</p>
+                )}
+            </div>
+        )}
+        {selectedFile && (
+            <div className="mt-4">
+                <button
+                    type="button"
+                    onClick={handleProcessFile}
+                    disabled={isParsing}
+                    className="inline-flex items-center justify-center px-4 py-2 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 disabled:bg-slate-400"
+                >
+                    {isParsing ? <><SpinnerIcon /> Parsing...</> : 'Process Selected File'}
+                </button>
+            </div>
+        )}
     </div>
   );
 
   return (
     <div className="max-w-7xl mx-auto p-4 sm:p-8 h-[calc(100vh-84px)] flex flex-col">
       <div className="text-center mb-6 flex-shrink-0">
-        <h1 className="text-4xl font-bold tracking-tight text-slate-900">Upload & Preview Files</h1>
-        <p className="mt-2 text-lg text-slate-600">Upload CSV files to preview their content before starting the audit.</p>
+        <h1 className="text-4xl font-bold tracking-tight text-slate-900">Connect to FTP Folder</h1>
+        <p className="mt-2 text-lg text-slate-600">Select a file from the FTP server to begin the audit.</p>
       </div>
 
       <form onSubmit={handleSubmit} className="bg-white rounded-lg shadow-md border border-slate-200 flex flex-col flex-grow min-h-0">
         <div className="flex-grow p-6 overflow-y-auto">
-          <Dropzone />
+          <FtpFileSelector />
           
           {parseError && (
               <div className="mt-4 bg-rose-50 border-l-4 border-rose-400 text-rose-800 p-4 rounded-md" role="alert">
-                <p className="font-bold flex items-center"><AlertTriangleIcon className="h-5 w-5 mr-2 text-rose-500" />Parsing Error</p>
+                <p className="font-bold flex items-center"><AlertTriangleIcon className="h-5 w-5 mr-2 text-rose-500" />Processing Error</p>
                 <p className="text-sm mt-1">{parseError}</p>
               </div>
           )}
 
-          {parsedResults.length > 0 && (
-            <div className="mt-6">
-              <h3 className="text-lg font-medium text-slate-800 mb-4">File Preview</h3>
-              <div className="border-b border-slate-200">
-                <nav className="-mb-px flex space-x-8" aria-label="Tabs">
-                  {parsedResults.map(({ fileName, result }) => (
-                    <button
-                      key={fileName}
-                      type="button"
-                      onClick={() => setActiveTab(fileName)}
-                      className={`whitespace-nowrap pb-4 px-1 border-b-2 font-medium text-sm transition-colors ${
-                        activeTab === fileName
-                          ? 'border-indigo-500 text-indigo-600'
-                          : 'border-transparent text-slate-500 hover:text-slate-700 hover:border-slate-300'
-                      }`}
-                    >
-                      {fileName} <span className="ml-2 px-2 py-0.5 rounded-full text-xs font-medium bg-slate-100 text-slate-600">{result.rows.length} rows</span>
-                    </button>
-                  ))}
-                </nav>
-              </div>
-              
-              <div className="mt-4">
-                  {currentActiveResult && <CsvPreviewTable parsedResult={currentActiveResult} />}
-              </div>
-            </div>
-          )}
+          {parsedResult && !isParsing && (
+                <div className="mt-6 bg-green-50 border-l-4 border-green-400 text-green-800 p-4 rounded-md" role="alert">
+                    <p className="font-bold flex items-center">
+                        <CheckCircleIcon className="h-5 w-5 mr-2 text-green-500" />
+                        File Processed Successfully
+                    </p>
+                    <p className="text-sm mt-1">
+                        Found <strong>{parsedResult.result.products.length}</strong> valid products in <span className="font-medium">{parsedResult.fileName}</span>.
+                        {parsedResult.result.errors.length > 0 && ` There were ${parsedResult.result.errors.length} errors.`}
+                    </p>
+                </div>
+           )}
         </div>
 
         <div className="flex-shrink-0 p-6 border-t border-slate-200 bg-slate-50/70 rounded-b-lg">
@@ -196,7 +183,7 @@ const FileUploadScreen: React.FC<FileUploadScreenProps> = ({ onRunAudit, onBack 
                         <p className="text-slate-500">Uncheck to use cached data from the last full audit for a faster start.</p>
                     </div>
                 </div>
-                 {parsedResults.length > 0 && !useBulkOperation && (
+                 {parsedResult && !parsedResult.fileName.toLowerCase().includes('shopifyproductimport.csv') && (
                     <div className="bg-blue-50 border-l-4 border-blue-400 text-blue-800 p-4 rounded-md" role="alert">
                         <p className="font-bold flex items-center"><AlertTriangleIcon className="h-5 w-5 mr-2 text-blue-500" />Note on Partial Audits</p>
                         <p className="text-sm mt-1">
