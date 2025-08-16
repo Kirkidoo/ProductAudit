@@ -1,6 +1,6 @@
 import { ShopifyCredentials, Discrepancy, Product, MissingProductGroup, ShopifyVariantNode } from '../types';
 
-const API_VERSION = '2024-04';
+const API_VERSION = '2025-07';
 const CORS_PROXY_URL = 'https://corsproxy.io/?';
 const DEFAULT_LOCATION_ID = 'gid://shopify/Location/86376317245'; // Hardcoded based on user feedback
 
@@ -217,20 +217,66 @@ const VARIANT_MEDIA_APPEND_MUTATION = `
   }
 `;
 
+// For Product/Variant Updates (Fixing)
+const PRODUCT_UPDATE_MUTATION = `
+  mutation productUpdate($input: ProductInput!) {
+    productUpdate(input: $input) {
+      product { id }
+      userErrors { field, message }
+    }
+  }
+`;
+
+const PRODUCT_VARIANT_UPDATE_MUTATION = `
+  mutation productVariantUpdate($input: ProductVariantInput!) {
+    productVariantUpdate(input: $input) {
+      productVariant { id }
+      userErrors { field, message }
+    }
+  }
+`;
+
+const GET_PRODUCT_DETAILS_FOR_FIX_QUERY = `
+  query getProductDetailsForFix($id: ID!) {
+    product(id: $id) {
+      bodyHtml
+      tags
+    }
+  }
+`;
+
+const PRODUCT_CREATE_MUTATION = `
+  mutation productCreate($input: ProductCreateInput!) {
+    productCreate(input: $input) {
+      product {
+        id
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
+const COLLECTION_ADD_PRODUCTS_MUTATION = `
+  mutation collectionAddProducts($id: ID!, $productIds: [ID!]!) {
+    collectionAddProducts(id: $id, productIds: $productIds) {
+      collection {
+        id
+      }
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
+
 // --- API Helper Functions ---
 
 const buildGraphqlApiUrl = (credentials: ShopifyCredentials) => {
     const baseUrl = `https://${credentials.storeName}.myshopify.com/admin/api/${API_VERSION}/graphql.json`;
-    return credentials.useCorsProxy ? `${CORS_PROXY_URL}${baseUrl}` : baseUrl;
-};
-
-const buildRestApiUrl = (credentials: ShopifyCredentials, endpoint: string) => {
-    // Special handling for inventory_levels.json with query params, as it doesn't end with .json
-    if (endpoint.includes('inventory_levels.json?')) {
-        const baseUrl = `https://${credentials.storeName}.myshopify.com/admin/api/${API_VERSION}/${endpoint}`;
-        return credentials.useCorsProxy ? `${CORS_PROXY_URL}${baseUrl}` : baseUrl;
-    }
-    const baseUrl = `https://${credentials.storeName}.myshopify.com/admin/api/${API_VERSION}/${endpoint}.json`;
     return credentials.useCorsProxy ? `${CORS_PROXY_URL}${baseUrl}` : baseUrl;
 };
 
@@ -257,49 +303,6 @@ const callShopifyGraphqlApi = async (credentials: ShopifyCredentials, query: str
     }
     return result;
 }
-
-const callShopifyRestApi = async (
-    credentials: ShopifyCredentials,
-    endpoint: string,
-    method: 'POST' | 'PUT' | 'GET' | 'DELETE' = 'GET',
-    payload?: object
-) => {
-    const url = buildRestApiUrl(credentials, endpoint);
-    const response = await fetch(url, {
-        method,
-        headers: buildHeaders(credentials.adminApiAccessToken),
-        body: payload ? JSON.stringify(payload) : undefined,
-    });
-    
-    if (!response.ok) {
-        let errorBody: any;
-        let rawErrorText = '';
-        try {
-            rawErrorText = await response.text();
-            errorBody = JSON.parse(rawErrorText);
-        } catch (e) {
-            errorBody = rawErrorText;
-        }
-
-        console.error("Shopify REST API Error Body:", errorBody);
-
-        let errorMessage;
-        if (typeof errorBody === 'object' && errorBody !== null && errorBody.errors) {
-            errorMessage = JSON.stringify(errorBody.errors);
-        } else if (typeof errorBody === 'object' && errorBody !== null) {
-            errorMessage = JSON.stringify(errorBody);
-        } else {
-            errorMessage = rawErrorText || `Request failed with status ${response.status}`;
-        }
-
-        throw new Error(`Shopify REST API call failed. ${errorMessage}`);
-    }
-
-    if (response.status === 204) {
-        return null;
-    }
-    return response.json();
-};
 
 const getCollectionIdByTitle = async (credentials: ShopifyCredentials, title: string): Promise<number | null> => {
     const formattedQuery = `title:"${title}"`;
@@ -600,114 +603,79 @@ export const updateVariantImages = async (
 
 
 export const fixShopifyProduct = async (credentials: ShopifyCredentials, discrepancy: Discrepancy): Promise<void> => {
-    // Product-level fixes are handled first.
-    if (discrepancy.Field === 'H1 in Description') {
+    // Product-level fixes
+    if (discrepancy.Field === 'H1 in Description' || discrepancy.Field === 'Missing Clearance Tag' || discrepancy.Field === 'Unexpected Clearance Tag') {
         if (!discrepancy.productId) {
-            throw new Error(`Cannot fix 'H1 in Description' without a product ID.`);
-        }
-        const numericProductId = discrepancy.productId.split('/').pop();
-        if (!numericProductId) {
-            throw new Error(`Invalid product GID: ${discrepancy.productId}`);
+            throw new Error(`Cannot fix '${discrepancy.Field}' without a product ID.`);
         }
 
-        // Fetch the current product to get the description
-        const productData = await callShopifyRestApi(credentials, `products/${numericProductId}`);
-        const currentDescription = productData?.product?.body_html;
-        
-        if (typeof currentDescription !== 'string') {
-            throw new Error(`Could not fetch product description for product ID ${numericProductId}.`);
+        // Fetch current product data (description and tags) in a single call
+        const { data: productDataResult } = await callShopifyGraphqlApi(credentials, GET_PRODUCT_DETAILS_FOR_FIX_QUERY, { id: discrepancy.productId });
+        const product = productDataResult.product;
+
+        if (!product) {
+            throw new Error(`Could not fetch product with GID ${discrepancy.productId}.`);
         }
 
-        // Replace h1 tags with h2 tags, preserving attributes
-        const newDescription = currentDescription
-            .replace(/<h1\b/gi, '<h2')
-            .replace(/<\/h1>/gi, '</h2>');
+        const productInput: { id: string; bodyHtml?: string; tags?: string[] } = { id: discrepancy.productId };
 
-        const payload = {
-            product: {
-                id: Number(numericProductId),
-                body_html: newDescription,
-            },
-        };
-        await callShopifyRestApi(credentials, `products/${numericProductId}`, 'PUT', payload);
+        if (discrepancy.Field === 'H1 in Description') {
+            const currentDescription = product.bodyHtml;
+            if (typeof currentDescription !== 'string') {
+                // This case should ideally not be hit if the product was fetched successfully.
+                throw new Error(`Could not get product description for product ID ${discrepancy.productId}.`);
+            }
+            const newDescription = currentDescription.replace(/<h1\b/gi, '<h2').replace(/<\/h1>/gi, '</h2>');
+            productInput.bodyHtml = newDescription;
+        } else { // Tag-related fixes
+            let currentTags: string[] = product.tags || [];
+            if (discrepancy.Field === 'Missing Clearance Tag') {
+                if (!currentTags.find(tag => tag.toLowerCase() === 'clearance')) {
+                    currentTags.push('Clearance');
+                }
+            } else { // Unexpected Clearance Tag
+                currentTags = currentTags.filter(tag => tag.toLowerCase() !== 'clearance');
+            }
+            productInput.tags = currentTags;
+        }
+
+        // Execute the update
+        const result = await callShopifyGraphqlApi(credentials, PRODUCT_UPDATE_MUTATION, { input: productInput });
+        const userErrors = result.data?.productUpdate?.userErrors;
+        if (userErrors && userErrors.length > 0) {
+            const errorMessages = userErrors.map((e: any) => e.message).join('; ');
+            throw new Error(`Failed to update product ${discrepancy.productId}: ${errorMessages}`);
+        }
         return;
     }
 
-    if (discrepancy.Field === 'Missing Clearance Tag' || discrepancy.Field === 'Unexpected Clearance Tag') {
-        if (!discrepancy.productId) {
-            throw new Error(`Cannot fix tag issue without a product ID.`);
-        }
-        const numericProductId = discrepancy.productId.split('/').pop();
-        if (!numericProductId) {
-            throw new Error(`Invalid product GID for tag fix: ${discrepancy.productId}`);
+    // Variant-level fixes
+    if (discrepancy.Field === 'Price' || discrepancy.Field === 'Compare Price Issue') {
+        if (!discrepancy.variantId) {
+            throw new Error(`Cannot fix '${discrepancy.Field}' without a variant ID.`);
         }
 
-        // Fetch the current product to get tags
-        const productData = await callShopifyRestApi(credentials, `products/${numericProductId}`);
-        const currentTagsString = productData?.product?.tags;
-        let currentTags: string[] = currentTagsString ? currentTagsString.split(',').map((t: string) => t.trim()).filter(Boolean) : [];
+        const variantInput: { id: string; price?: string; compareAtPrice?: string | null } = { id: discrepancy.variantId };
 
-        if (discrepancy.Field === 'Missing Clearance Tag') {
-            if (!currentTags.find(tag => tag.toLowerCase() === 'clearance')) {
-                currentTags.push('Clearance');
-            }
-        } else { // Unexpected Clearance Tag
-            currentTags = currentTags.filter(tag => tag.toLowerCase() !== 'clearance');
+        if (discrepancy.Field === 'Price') {
+            variantInput.price = discrepancy.FtpValue.toString();
+        } else { // Compare Price Issue
+            variantInput.compareAtPrice = typeof discrepancy.FtpValue === 'number' && discrepancy.FtpValue > 0
+                ? discrepancy.FtpValue.toString()
+                : null;
         }
 
-        const payload = {
-            product: {
-                id: Number(numericProductId),
-                tags: currentTags.join(', '),
-            },
-        };
-        await callShopifyRestApi(credentials, `products/${numericProductId}`, 'PUT', payload);
+        const result = await callShopifyGraphqlApi(credentials, PRODUCT_VARIANT_UPDATE_MUTATION, { input: variantInput });
+        const userErrors = result.data?.productVariantUpdate?.userErrors;
+        if (userErrors && userErrors.length > 0) {
+            const errorMessages = userErrors.map((e: any) => e.message).join('; ');
+            throw new Error(`Failed to update variant ${discrepancy.variantId}: ${errorMessages}`);
+        }
         return;
     }
-    
-    // Variant-level fixes are handled below.
-    const variantId = discrepancy.variantId.split('/').pop();
-    if (!variantId) {
-        throw new Error(`Invalid variant GID: ${discrepancy.variantId}`);
-    }
 
-    let payload: { variant: { id: number; price?: string; compare_at_price?: string | null } };
-
-    if (discrepancy.Field === 'Price') {
-        payload = {
-            variant: {
-                id: Number(variantId),
-                price: discrepancy.FtpValue.toString(),
-            }
-        };
-    } else if (discrepancy.Field === 'Compare Price Issue') {
-        const newComparePrice = typeof discrepancy.FtpValue === 'number' && discrepancy.FtpValue > 0
-            ? discrepancy.FtpValue.toString()
-            : null;
-
-        payload = {
-            variant: {
-                id: Number(variantId),
-                compare_at_price: newComparePrice,
-            }
-        };
-    } else {
-        throw new Error(`Unsupported discrepancy field for fixing: ${discrepancy.Field}`);
-    }
-
-    await callShopifyRestApi(credentials, `variants/${variantId}`, 'PUT', payload);
+    throw new Error(`Unsupported discrepancy field for fixing: ${discrepancy.Field}`);
 };
-
-const mapRestWeightUnit = (unit?: string): 'g' | 'kg' | 'oz' | 'lb' | undefined => {
-    if (!unit) return undefined;
-    const lowerUnit = unit.toLowerCase();
-    if (lowerUnit.startsWith('g')) return 'g';
-    if (lowerUnit.startsWith('k')) return 'kg';
-    if (lowerUnit.startsWith('o')) return 'oz';
-    if (lowerUnit.startsWith('p') || lowerUnit.startsWith('lb')) return 'lb';
-    return undefined;
-};
-
 
 export const createShopifyProduct = async (credentials: ShopifyCredentials, productGroup: MissingProductGroup, targetLocationGid: string): Promise<void> => {
     // --- Step 0: Pre-flight SKU check (Unchanged) ---
@@ -721,198 +689,103 @@ export const createShopifyProduct = async (credentials: ShopifyCredentials, prod
         }
     }
 
-    // --- Step 1: Prepare product payload (Mostly Unchanged) ---
+    // --- Step 1: Prepare GraphQL ProductCreateInput ---
     const getOptionValue = (value: string | undefined, fallback: string) => (value?.trim() || fallback);
     const optionNames = [productGroup.option1Name, productGroup.option2Name, productGroup.option3Name].filter((n): n is string => !!n && n.trim() !== '');
-    const uniqueImages = Array.from(new Map(productGroup.images.map(img => [img.originalSrc, img])).values());
-    const imagesForCreate = uniqueImages.filter(img => img.originalSrc && !img.originalSrc.includes('via.placeholder.com')).map(img => ({ src: img.originalSrc, alt: img.altText || productGroup.title }));
 
-    const variantsForCreate = productGroup.variants.map(v => {
-        const variantPayload: any = {
-            price: v.Price, sku: v.SKU, inventory_management: 'shopify', inventory_policy: 'deny',
-            barcode: v.barcode, compare_at_price: v.compareAtPrice, grams: v.variantGrams,
-            weight_unit: mapRestWeightUnit(v.variantWeightUnit), cost: v.costPerItem,
-        };
-        if (optionNames.length > 0) {
-            if (productGroup.option1Name) variantPayload.option1 = getOptionValue(v.option1Value, v.SKU);
-            if (productGroup.option2Name) variantPayload.option2 = getOptionValue(v.option2Value, '-');
-            if (productGroup.option3Name) variantPayload.option3 = getOptionValue(v.option3Value, '-');
-        } else {
-             variantPayload.option1 = "Default Title";
-        }
-        return variantPayload;
-    });
-    
-    const tagsToApply: string[] = [];
-    if (productGroup.isClearance) {
-        tagsToApply.push('Clearance');
-    }
-    
-    const productPayload = {
-        product: {
-            title: productGroup.title, body_html: productGroup.description?.replace(/<\/?h1>/gi, match => match.replace('1', '2')),
-            vendor: productGroup.vendor, product_type: productGroup.productType, handle: productGroup.handle,
-            tags: tagsToApply.join(', '),
-            images: imagesForCreate, variants: variantsForCreate,
-            options: optionNames.length > 0 ? optionNames.map(name => ({ name })) : [{ name: "Title" }],
-        }
+    const tagsToApply: string[] = productGroup.isClearance ? ['Clearance'] : [];
+
+    // Map weight unit to GraphQL enum
+    const mapGqlWeightUnit = (unit?: string): 'GRAMS' | 'KILOGRAMS' | 'OUNCES' | 'POUNDS' | undefined => {
+        if (!unit) return undefined;
+        const lowerUnit = unit.toLowerCase();
+        if (lowerUnit.startsWith('g')) return 'GRAMS';
+        if (lowerUnit.startsWith('k')) return 'KILOGRAMS';
+        if (lowerUnit.startsWith('o')) return 'OUNCES';
+        if (lowerUnit.startsWith('p') || lowerUnit.startsWith('lb')) return 'POUNDS';
+        return undefined;
     };
 
+    // Prepare variants for GraphQL, including inventory and media association
+    const variantsForCreate = productGroup.variants.map(v => {
+        const options = [];
+        if (productGroup.option1Name) options.push(getOptionValue(v.option1Value, v.SKU));
+        if (productGroup.option2Name) options.push(getOptionValue(v.option2Value, '-'));
+        if (productGroup.option3Name) options.push(getOptionValue(v.option3Value, '-'));
 
-    // --- Step 2: Create product via REST API (Unchanged) ---
-    const createResult = await callShopifyRestApi(credentials, 'products', 'POST', productPayload);
-    if (!createResult || !createResult.product) throw new Error("Failed to create product. Response was empty or invalid.");
-    const createdProduct = createResult.product;
-    const productGid = `gid://shopify/Product/${createdProduct.id}`;
-    const createdVariantsMap = new Map<string, any>(createdProduct.variants.map((v: any) => [v.sku, v]));
+        const variantInput: any = {
+            price: v.Price,
+            sku: v.SKU,
+            barcode: v.barcode,
+            compareAtPrice: v.compareAtPrice,
+            options: options.length > 0 ? options : ["Default Title"],
+            inventoryPolicy: 'DENY',
+            inventoryItem: {
+                cost: v.costPerItem,
+                tracked: true,
+            },
+            weight: v.variantGrams ? parseFloat(v.variantGrams.toString()) : undefined,
+            weightUnit: v.variantGrams ? mapGqlWeightUnit(v.variantWeightUnit) || 'GRAMS' : undefined,
+        };
 
-    // --- Step 3: Run all post-creation tasks CONCURRENTLY ---
+        // Associate variant with its image by URL during creation
+        if (v.ImageUrl) {
+            variantInput.mediaSrc = [v.ImageUrl];
+        }
+
+        // Set initial inventory quantity for the target location
+        if (typeof v.StockQuantity === 'number') {
+            variantInput.inventoryQuantities = [{
+                availableQuantity: v.StockQuantity,
+                locationId: targetLocationGid
+            }];
+        }
+
+        return variantInput;
+    });
+
+    // Prepare media (images) for GraphQL
+    const uniqueImages = Array.from(new Map(productGroup.images.map(img => [img.originalSrc, img])).values());
+    const mediaForCreate = uniqueImages
+        .filter(img => img.originalSrc && !img.originalSrc.includes('via.placeholder.com'))
+        .map(img => ({
+            originalSource: img.originalSrc,
+            alt: img.altText || productGroup.title,
+            mediaContentType: 'IMAGE' as const
+        }));
+
+    // Assemble the final ProductCreateInput payload
+    const productInput = {
+        title: productGroup.title,
+        bodyHtml: productGroup.description?.replace(/<\/?h1>/gi, match => match.replace('1', '2')),
+        vendor: productGroup.vendor,
+        productType: productGroup.productType,
+        handle: productGroup.handle,
+        tags: tagsToApply,
+        options: optionNames.length > 0 ? optionNames : ["Title"],
+        variants: variantsForCreate,
+        media: mediaForCreate,
+    };
+
+    // --- Step 2: Create product via GraphQL ---
+    const createResult = await callShopifyGraphqlApi(credentials, PRODUCT_CREATE_MUTATION, { input: productInput });
+
+    const userErrors = createResult.data?.productCreate?.userErrors;
+    if (userErrors && userErrors.length > 0) {
+        const errorMessages = userErrors.map((e: any) => `[${e.field?.join('.')}] ${e.message}`).join('; ');
+        throw new Error(`Failed to create product '${productGroup.title}': ${errorMessages}`);
+    }
+
+    const productGid = createResult.data?.productCreate?.product?.id;
+    if (!productGid) {
+        throw new Error(`Failed to create product '${productGroup.title}'. Response was empty or invalid.`);
+    }
+
+    // --- Step 3: Run remaining post-creation tasks CONCURRENTLY ---
+    // Note: Image linking and inventory are now handled during creation.
     const postCreationTasks: Promise<any>[] = [];
 
-    // **REVISED Task A: Link variant images using GraphQL**
-    postCreationTasks.push((async () => {
-        try {
-            // It might take a moment for the new product and its media to be available via GraphQL after creation via REST. A small delay could help.
-            await delay(2000); // Wait 2 seconds for propagation.
-
-            // Fetch the media GIDs for the newly created images
-            const { data: mediaData } = await callShopifyGraphqlApi(credentials, GET_PRODUCT_MEDIA_QUERY, { id: productGid });
-            
-            const urlToMediaIdMap = new Map<string, string>();
-            mediaData?.product?.media?.edges.forEach((edge: any) => {
-                if (edge.node?.id && edge.node?.image?.originalSrc) {
-                    urlToMediaIdMap.set(edge.node.image.originalSrc, edge.node.id);
-                }
-            });
-            
-            if (urlToMediaIdMap.size === 0 && productGroup.images.some(i => i.originalSrc)) {
-                console.warn(`Could not find any media GIDs for product ${productGid} after creation. Image linking will be skipped.`);
-            }
-
-            // Prepare the payload for productVariantAppendMedia
-            const variantMediaPayload: { variantId: string; mediaIds: string[] }[] = [];
-            productGroup.variants.forEach(sourceVariant => {
-                if (!sourceVariant.ImageUrl) return;
-
-                const mediaId = urlToMediaIdMap.get(sourceVariant.ImageUrl);
-                const createdVariant = createdVariantsMap.get(sourceVariant.SKU);
-                
-                if (mediaId && createdVariant) {
-                    const variantGid = `gid://shopify/ProductVariant/${createdVariant.id}`;
-                    variantMediaPayload.push({
-                        variantId: variantGid,
-                        mediaIds: [mediaId]
-                    });
-                } else if (!mediaId) {
-                    console.warn(`Could not find mediaId for image URL: ${sourceVariant.ImageUrl} on product ${productGid}`);
-                }
-            });
-
-            if (variantMediaPayload.length > 0) {
-                const { data: appendResult } = await callShopifyGraphqlApi(credentials, VARIANT_MEDIA_APPEND_MUTATION, {
-                    productId: productGid,
-                    variantMedia: variantMediaPayload
-                });
-                const userErrors = appendResult?.productVariantAppendMedia?.userErrors;
-                 if (userErrors && userErrors.length > 0) {
-                    const errorMessages = userErrors.map((e: any) => e.message).join('; ');
-                    throw new Error(`Failed to link images via GraphQL: ${errorMessages}`);
-                }
-            }
-        } catch (e) {
-            // Re-throw to make the product creation fail and report the error to the user.
-            throw new Error(`Image linking failed for ${productGroup.handle}. Reason: ${e instanceof Error ? e.message : String(e)}`);
-        }
-    })());
-    
-    // Task B: Inventory Management
-    postCreationTasks.push((async () => {
-        const itemGids = createdProduct.variants
-            .map((v: any) => v.inventory_item_id ? `gid://shopify/InventoryItem/${v.inventory_item_id}` : null)
-            .filter((id: string | null): id is string => id !== null);
-
-        if (itemGids.length === 0) {
-            console.warn(`No valid inventory item IDs for product ${productGroup.handle}. Skipping inventory management.`);
-            return;
-        }
-        
-        const GET_INVENTORY_LEVELS_QUERY = `
-          query getInventoryLevels($ids: [ID!]!) {
-            nodes(ids: $ids) {
-              ... on InventoryItem {
-                id
-                inventoryLevels(first: 10) {
-                  edges {
-                    node {
-                      id # This is the inventoryLevelId we need
-                      location {
-                        id
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        `;
-
-        try {
-            const { data: levelsResult } = await callShopifyGraphqlApi(credentials, GET_INVENTORY_LEVELS_QUERY, { ids: itemGids });
-            const itemToDefaultLevelIdMap = new Map<string, string>();
-
-            if (levelsResult.nodes) {
-                for (const node of levelsResult.nodes) {
-                    if (node && node.inventoryLevels) {
-                        const defaultLevelEdge = node.inventoryLevels.edges.find((edge: any) => edge.node.location.id === DEFAULT_LOCATION_ID);
-                        if (defaultLevelEdge) {
-                            itemToDefaultLevelIdMap.set(node.id, defaultLevelEdge.node.id);
-                        }
-                    }
-                }
-            }
-
-            const mutationParts: string[] = [];
-            let aliasCounter = 0;
-            const defaultLocationGid = DEFAULT_LOCATION_ID;
-
-            for (const variant of productGroup.variants) {
-                const createdVar = createdVariantsMap.get(variant.SKU);
-                if (!createdVar || !createdVar.inventory_item_id) continue;
-                
-                const itemGid = `gid://shopify/InventoryItem/${createdVar.inventory_item_id}`;
-
-                if (variant.StockQuantity !== undefined) {
-                    mutationParts.push(`
-                        activate_${aliasCounter}: inventoryActivate(inventoryItemId: "${itemGid}", locationId: "${targetLocationGid}", available: ${variant.StockQuantity}) {
-                            inventoryLevel { id } userErrors { field, message }
-                        }`);
-                }
-                
-                const defaultLevelId = itemToDefaultLevelIdMap.get(itemGid);
-                if (defaultLocationGid !== targetLocationGid && defaultLevelId) {
-                    mutationParts.push(`
-                        deactivate_${aliasCounter}: inventoryDeactivate(inventoryLevelId: "${defaultLevelId}") {
-                            userErrors { field, message }
-                        }`);
-                }
-                aliasCounter++;
-            }
-
-            if (mutationParts.length > 0) {
-                const inventoryMutation = `mutation inventoryManagement { ${mutationParts.join('\n')} }`;
-                const { data: result } = await callShopifyGraphqlApi(credentials, inventoryMutation);
-                const allErrors = Object.values(result || {}).flatMap((res: any) => res.userErrors || []).filter(Boolean);
-                if (allErrors.length > 0) {
-                    const errorMessages = allErrors.map((e: any) => e.message).join('; ');
-                    console.warn(`Could not complete all inventory ops for ${productGroup.handle}: ${errorMessages}`);
-                }
-            }
-        } catch (e) {
-            console.error(`Failed during inventory management task for ${productGroup.handle}:`, e);
-        }
-    })().catch(e => console.error(`Inventory task failed for ${productGroup.handle}:`, e)));
-
-    // Task C: Publishing
+    // Task A: Publishing
     const publicationInputs = SALES_CHANNEL_PUBLICATION_IDS.map(pubId => ({ publicationId: pubId }));
     if (publicationInputs.length > 0) {
         postCreationTasks.push(
@@ -921,13 +794,13 @@ export const createShopifyProduct = async (credentials: ShopifyCredentials, prod
         );
     }
 
-    // Task D: Collection Linking
+    // Task B: Collection Linking (now using GraphQL)
     if (productGroup.productCategory) {
         postCreationTasks.push(
-            getCollectionIdByTitle(credentials, productGroup.productCategory).then(collectionId => {
-                if (collectionId) {
-                    const collectPayload = { collect: { product_id: createdProduct.id, collection_id: collectionId } };
-                    return callShopifyRestApi(credentials, 'collects', 'POST', collectPayload);
+            getCollectionIdByTitle(credentials, productGroup.productCategory).then(legacyCollectionId => {
+                if (legacyCollectionId) {
+                    const collectionGid = `gid://shopify/Collection/${legacyCollectionId}`;
+                    return callShopifyGraphqlApi(credentials, COLLECTION_ADD_PRODUCTS_MUTATION, { id: collectionGid, productIds: [productGid] });
                 }
             }).catch(e => console.warn(`Failed to link collection for ${productGroup.handle}:`, e))
         );
